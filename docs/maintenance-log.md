@@ -583,3 +583,22 @@
   - 对延迟出现的 `/id/login/correction/privacy-policy` 重定向改为显式识别，给出明确的人工确认提示，不再落成泛化的 `//egs-navigation` 超时异常。
   - 领取页登录态检查改成短轮询稳态等待，避免刚跳转时的瞬时中间页被误判成未知异常。
   - Celery 调度入口与主入口统一：认证失败会立即终止，而不是继续进入领取阶段。
+
+### 2026-05-17 设备不兼容弹窗探测与按钮上下文采样加固
+
+- 现象：
+  - 最新运行里，登录已经成功并完成 `Epic store session verification success`，但 `the-telltale-batman` 商品页连续出现 `Purchase button ... click returned without visible progress`。
+  - 调试截图和文本已经明确显示 `Device not supported` / `This product is not compatible with your current device` / `Continue`，但运行日志里没有进入设备弹窗处理分支。
+  - 随后处理下一个商品时，`_log_purchase_button_context()` 在读取 `purchase-cta-button` 文本时触发 `Locator.text_content: Timeout 30000ms exceeded`，把异常放大成整轮失败。
+- 根因判断：
+  - 现有设备弹窗探测把“弹窗存在”绑定在“Continue 按钮 locator 也必须短时间内可见”上；当 Epic 弹窗 DOM 形态变化或按钮可见性探测抖动时，会出现“页面文本里弹窗明明存在，但代码判断为不存在”的漏判。
+  - `click_no_effect` 路径在最终判失败前没有做一次更强的 blocker 复查，因此会把“仍被设备弹窗挡住”误收口成普通点击无效。
+  - 购买按钮上下文采样使用默认长超时，不适合作为调试函数直接挂在主流程里。
+- 改动文件：
+  - `app/services/epic_games_service.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 将设备弹窗存在判定改为基于 page/frame 文本 marker 的独立检测，不再要求 `Continue` locator 先可见才承认弹窗存在。
+  - `Continue` 点击兜底新增面向 dialog/modal/overlay 容器的浏览器端扫描：优先点击容器内最后一个可见的 `Continue` 按钮，抓不到时再退化成容器内最后一个可见按钮。
+  - `_click_purchase_button()` 在所有点击策略都无进展后，会先做一次强复查并再次尝试清理设备弹窗，再决定是否落成 `click_no_effect`。
+  - `_log_purchase_button_context()` 改成短超时采样和受控降级，不再让调试信息读取本身触发 30 秒硬超时。

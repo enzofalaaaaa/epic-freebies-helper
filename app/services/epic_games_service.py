@@ -400,7 +400,99 @@ class EpicGames:
             if clicked:
                 return True
 
+        with suppress(Exception):
+            clicked = await page.evaluate(
+                """
+                () => {
+                  const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim().toUpperCase();
+                  const isVisible = (element) => {
+                    const rect = element.getBoundingClientRect();
+                    const style = window.getComputedStyle(element);
+                    return rect.width > 0 && rect.height > 0 &&
+                      style.visibility !== 'hidden' &&
+                      style.display !== 'none' &&
+                      style.opacity !== '0';
+                  };
+
+                  const modalMarkers = [
+                    'DEVICE NOT SUPPORTED',
+                    'NOT COMPATIBLE WITH YOUR CURRENT DEVICE'
+                  ];
+                  const containerSelectors = [
+                    '[role="dialog"]',
+                    'dialog',
+                    '[aria-modal="true"]',
+                    '[data-testid*="modal"]',
+                    '[class*="modal"]',
+                    '[class*="Modal"]',
+                    '[class*="overlay"]',
+                    '[class*="Overlay"]'
+                  ];
+
+                  const containers = [];
+                  for (const selector of containerSelectors) {
+                    for (const element of document.querySelectorAll(selector)) {
+                      if (containers.includes(element) || !isVisible(element)) {
+                        continue;
+                      }
+                      const text = normalize(element.innerText);
+                      if (modalMarkers.some((marker) => text.includes(marker))) {
+                        containers.push(element);
+                      }
+                    }
+                  }
+
+                  const visibleButtons = [];
+                  for (const container of containers) {
+                    for (const button of container.querySelectorAll('button')) {
+                      if (isVisible(button)) {
+                        visibleButtons.push(button);
+                      }
+                    }
+                  }
+
+                  let continueButton = null;
+                  for (let index = visibleButtons.length - 1; index >= 0; index -= 1) {
+                    const button = visibleButtons[index];
+                    if (normalize(button.innerText).includes('CONTINUE')) {
+                      continueButton = button;
+                      break;
+                    }
+                  }
+                  const fallbackButton =
+                    visibleButtons.length > 0 ? visibleButtons[visibleButtons.length - 1] : null;
+                  const button = continueButton || fallbackButton;
+
+                  if (!button) {
+                    return false;
+                  }
+
+                  button.click();
+                  return true;
+                }
+                """
+            )
+            if clicked:
+                return True
+
         return False
+
+    @staticmethod
+    async def _device_not_supported_marker_present(
+        page: Page, timeout: int = 500, frame_timeout: int = 300
+    ) -> bool:
+        try:
+            combined_text = await EpicGames._combined_text(
+                page, timeout=timeout, frame_timeout=frame_timeout
+            )
+        except Exception:
+            return False
+
+        markers = (
+            "DEVICE NOT SUPPORTED",
+            "NOT COMPATIBLE WITH YOUR CURRENT DEVICE",
+        )
+        return any(marker in combined_text for marker in markers)
 
     @staticmethod
     async def _claim_state_reason(page: Page, url: str) -> str | None:
@@ -545,30 +637,7 @@ class EpicGames:
 
     @staticmethod
     async def _is_device_not_supported_visible(page: Page) -> bool:
-        try:
-            body_text = await EpicGames._combined_text(page, timeout=500, frame_timeout=300)
-        except Exception:
-            body_text = ""
-
-        candidates = [
-            page.get_by_role("button", name="Continue"),
-            page.locator(
-                "//button[normalize-space(.)='Continue' or .//span[normalize-space(.)='Continue']]"
-            ),
-        ]
-        continue_visible = False
-        for locator in candidates:
-            if await EpicGames._is_locator_visible(locator, timeout=250):
-                continue_visible = True
-                break
-
-        if "DEVICE NOT SUPPORTED" in body_text and continue_visible:
-            return True
-
-        if "NOT COMPATIBLE WITH YOUR CURRENT DEVICE" in body_text and continue_visible:
-            return True
-
-        return False
+        return await EpicGames._device_not_supported_marker_present(page)
 
     @staticmethod
     async def _has_purchase_progress(page: Page, url: str) -> bool:
@@ -663,6 +732,17 @@ class EpicGames:
                 "Purchase button {} click returned without visible progress - {}", name, url
             )
 
+        if await EpicGames._device_not_supported_marker_present(page, timeout=1500, frame_timeout=800):
+            logger.warning(
+                "Purchase button click made no progress because device modal is still blocking - {}",
+                url,
+            )
+            await EpicGames._handle_device_not_supported_modal(page, url, timeout_ms=5000)
+            await page.wait_for_timeout(1500)
+            if await self._has_purchase_progress(page, url):
+                logger.debug("Device modal dismissal restored claim progress - {}", url)
+                return True
+
         await self._capture_purchase_debug(page, "click_no_effect", url)
         return False
 
@@ -674,7 +754,7 @@ class EpicGames:
         captured = False
 
         while elapsed < timeout_ms:
-            if await EpicGames._is_device_not_supported_visible(page):
+            if await EpicGames._device_not_supported_marker_present(page):
                 logger.warning(
                     f"Device not supported modal detected - attempting to continue. {url=}"
                 )
@@ -685,7 +765,9 @@ class EpicGames:
                 try:
                     if await EpicGames._click_visible_continue_button(page):
                         await page.wait_for_timeout(2000)
-                        if not await EpicGames._is_device_not_supported_visible(page):
+                        if not await EpicGames._device_not_supported_marker_present(
+                            page, timeout=1200, frame_timeout=800
+                        ):
                             logger.success("Dismissed device not supported modal")
                             return True
 
@@ -713,18 +795,33 @@ class EpicGames:
 
     @staticmethod
     async def _log_purchase_button_context(page: Page, purchase_btn, url: str):
-        btn_text = (await purchase_btn.text_content() or "").strip()
-        disabled = await purchase_btn.get_attribute("disabled")
-        aria_disabled = await purchase_btn.get_attribute("aria-disabled")
-        btn_class = await purchase_btn.get_attribute("class")
-        btn_testid = await purchase_btn.get_attribute("data-testid")
+        btn_text = ""
+        with suppress(Exception):
+            btn_text = ((await purchase_btn.text_content(timeout=1000)) or "").strip()
+
+        disabled = None
+        with suppress(Exception):
+            disabled = await purchase_btn.get_attribute("disabled", timeout=1000)
+
+        aria_disabled = None
+        with suppress(Exception):
+            aria_disabled = await purchase_btn.get_attribute("aria-disabled", timeout=1000)
+
+        btn_class = None
+        with suppress(Exception):
+            btn_class = await purchase_btn.get_attribute("class", timeout=1000)
+
+        btn_testid = None
+        with suppress(Exception):
+            btn_testid = await purchase_btn.get_attribute("data-testid", timeout=1000)
+
         container_text = ""
 
         with suppress(Exception):
             container = purchase_btn.locator(
                 "xpath=ancestor::*[self::section or self::aside or self::div][1]"
             )
-            container_text = (await container.text_content() or "").strip()
+            container_text = ((await container.text_content(timeout=1000)) or "").strip()
             container_text = " ".join(container_text.split())[:800]
 
         logger.debug(
